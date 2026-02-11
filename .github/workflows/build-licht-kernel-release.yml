@@ -1,0 +1,133 @@
+name: Build licht_defconfig kernels and release direct-boot artifacts
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional release tag (for example: v1.0.0). If empty, uses sha-<12-char-commit>.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: amd64
+            runs_on: ubuntu-latest
+            karch: x86
+          - target: arm64
+            runs_on: ubuntu-24.04-arm
+            karch: arm64
+    runs-on: ${{ matrix.runs_on }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            ccache \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            pahole
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Makefile', 'arch/x86/configs/licht_defconfig', 'arch/arm64/configs/licht_defconfig') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p .ccache
+          ccache --set-config=cache_dir=${GITHUB_WORKSPACE}/.ccache
+          ccache --set-config=max_size=2G
+          ccache --zero-stats
+
+      - name: Configure kernel (${{ matrix.target }})
+        run: |
+          make ARCH=${{ matrix.karch }} licht_defconfig
+
+      - name: Build vmlinux (${{ matrix.target }})
+        run: |
+          make -j"$(nproc)" ARCH=${{ matrix.karch }} CC="ccache gcc" vmlinux
+
+      - name: Build arm64 Image (direct boot)
+        if: matrix.karch == 'arm64'
+        run: |
+          make -j"$(nproc)" ARCH=arm64 CC="ccache gcc" Image
+
+      - name: Show ccache stats
+        run: ccache --show-stats
+
+      - name: Prepare artifact (${{ matrix.target }})
+        run: |
+          mkdir -p dist
+          cp vmlinux "dist/vmlinux-${{ matrix.target }}"
+          sha256sum "dist/vmlinux-${{ matrix.target }}" > "dist/vmlinux-${{ matrix.target }}.sha256"
+          if [ "${{ matrix.karch }}" = "arm64" ]; then
+            cp arch/arm64/boot/Image "dist/Image-${{ matrix.target }}"
+            sha256sum "dist/Image-${{ matrix.target }}" > "dist/Image-${{ matrix.target }}.sha256"
+          fi
+
+      - name: Upload artifact (${{ matrix.target }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: licht-kernel-${{ matrix.target }}
+          path: dist/*-${{ matrix.target }}*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="sha-${GITHUB_SHA::12}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $TAG"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: licht-kernel-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          overwrite_files: true
+          files: release-assets/*
